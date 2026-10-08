@@ -1,0 +1,176 @@
+<?php
+
+namespace App\Http\Middleware;
+
+use App\Models\Program;
+use App\Models\User;
+use App\Services\Auth\ImpersonationService;
+use App\Services\SiteSetting\SiteSettingService;
+use Illuminate\Http\Request;
+use Inertia\Middleware;
+
+class HandleInertiaRequests extends Middleware
+{
+    /**
+     * @see https://inertiajs.com/server-side-setup#root-template
+     *
+     * @var string
+     */
+    protected $rootView = 'app';
+
+    /**
+     * @see https://inertiajs.com/asset-versioning
+     */
+    public function version(Request $request): ?string
+    {
+        return parent::version($request);
+    }
+
+    /**
+     * @see https://inertiajs.com/shared-data
+     *
+     * @return array<string, mixed>
+     */
+    public function share(Request $request): array
+    {
+        return [
+            ...parent::share($request),
+            'auth' => fn () => ['user' => $this->authUser($request)],
+            'portal' => fn () => ['base' => $request->is('admin', 'admin/*') ? '/admin' : ''],
+            'flash' => [
+                'success' => fn () => $request->session()->get('success'),
+                'error' => fn () => $request->session()->get('error'),
+            ],
+            'impersonation' => fn () => $this->impersonation($request),
+            'locale' => fn () => app()->getLocale(),
+            'programs' => fn () => $this->publicPrograms($request),
+            'site' => fn () => app(SiteSettingService::class)->shared(),
+            'student' => fn () => $this->studentUser($request),
+            'teacher' => fn () => $this->teacherUser($request),
+        ];
+    }
+
+    /**
+     * @return array<string, mixed>|null
+     */
+    private function studentUser(Request $request): ?array
+    {
+        if ($request->is('admin', 'admin/*')) {
+            return null;
+        }
+
+        $student = $request->user('student');
+
+        if (! $student || ! $student->is_active) {
+            return null;
+        }
+
+        $student->loadMissing('college:id,slug,name_bn,name_en');
+
+        return [
+            ...$student->only('id', 'name', 'email', 'phone'),
+            'college' => $student->college === null ? null : [
+                'id' => $student->college->id,
+                'slug' => $student->college->slug,
+                'name' => $student->college->translated('name'),
+            ],
+        ];
+    }
+
+    /**
+     * @return array<string, mixed>|null
+     */
+    private function teacherUser(Request $request): ?array
+    {
+        if ($request->is('admin', 'admin/*')) {
+            return null;
+        }
+
+        $teacher = $request->user('teacher');
+
+        if (! $teacher) {
+            return null;
+        }
+
+        $teacher->loadMissing('college:id,slug,name_bn,name_en');
+
+        return [
+            'id' => $teacher->id,
+            'name' => $teacher->name,
+            'email' => $teacher->email,
+            'phone' => $teacher->phone,
+            'designation' => $teacher->designation_en ?? $teacher->designation_bn,
+            'is_active' => $teacher->is_active,
+            'college' => $teacher->college === null ? null : [
+                'id' => $teacher->college->id,
+                'slug' => $teacher->college->slug,
+                'name' => $teacher->college->translated('name'),
+            ],
+        ];
+    }
+
+    /**
+     * Shared only on public pages so the program switcher costs no request;
+     * the admin side gets an empty list.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    private function publicPrograms(Request $request): array
+    {
+        if ($request->is('admin', 'admin/*')) {
+            return [];
+        }
+
+        return Program::query()
+            ->where('is_active', true)
+            ->orderBy('sort_order')
+            ->orderBy('id')
+            ->get()
+            ->map(fn (Program $program) => [
+                'id' => $program->id,
+                'slug' => $program->slug,
+                'name' => $program->translated('name'),
+                'short_name' => $program->translated('short_name', false),
+                'has_levels' => $program->has_levels,
+                'has_exam_stages' => $program->has_exam_stages,
+            ])
+            ->all();
+    }
+
+    /**
+     * @return array{name: string, since: int}|null
+     */
+    private function impersonation(Request $request): ?array
+    {
+        if (! $request->hasSession()) {
+            return null;
+        }
+
+        if (! app(ImpersonationService::class)->isImpersonating()) {
+            return null;
+        }
+
+        return [
+            'name' => (string) $request->user()?->name,
+            'since' => (int) $request->session()->get(ImpersonationService::SESSION_STARTED_AT),
+        ];
+    }
+
+    /**
+     * @return array<string, mixed>|null
+     */
+    private function authUser(Request $request): ?array
+    {
+        $account = $request->user();
+
+        if (! $account instanceof User) {
+            return null;
+        }
+
+        return [
+            ...$account->only('id', 'name', 'email'),
+            'roles' => $account->effectiveRoleNames()->all(),
+            'permissions' => $account->getAllPermissions()->pluck('name')->all(),
+        ];
+    }
+}

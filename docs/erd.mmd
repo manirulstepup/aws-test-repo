@@ -1,0 +1,85 @@
+---
+title: AinPath — Entity Relationship Diagram
+---
+erDiagram
+
+    %% ── Identity & access ───────────────────────────────────────────
+    USERS {
+        bigint id PK
+        string name
+        string email UK
+        string phone
+        string image
+        string Password
+    }
+
+    ROLES {
+        bigint id PK
+        string name
+        string guard_name
+    }
+
+    PERMISSIONS {
+        bigint id PK
+        string name
+        string guard_name
+    }
+
+    MODEL_HAS_ROLES {
+        bigint role_id FK
+        string model_type
+        bigint model_id
+    }
+
+    MODEL_HAS_PERMISSIONS {
+        bigint permission_id FK
+        string model_type
+        bigint model_id
+    }
+
+    ROLE_HAS_PERMISSIONS {
+        bigint permission_id FK
+        bigint role_id FK
+    }
+
+    PERSONAL_ACCESS_TOKENS {
+        bigint id PK
+        string tokenable_type
+        bigint tokenable_id
+        string token UK
+    }
+
+    NOTIFICATIONS {
+        uuid id PK
+        string notifiable_type
+        bigint notifiable_id
+        text data
+        timestamp read_at
+    }
+
+    ACTIVITY_LOGS {
+        bigint id PK
+        string type
+        string subject_type
+        bigint subject_id
+        string causer_type
+        bigint causer_id
+        text description
+    }
+
+    PassWORD_RESET_TOKENS {
+        string email PK
+        string token
+    }
+
+    %% ── Relationships: identity & access ────────────────────────────
+    USERS   ||--o{ MODEL_HAS_ROLES          : "has roles (morph)"
+    USERS   ||--o{ MODEL_HAS_PERMISSIONS    : "direct permissions (morph)"
+    USERS   ||--o{ PERSONAL_ACCESS_TOKENS   : "tokens (morph)"
+    USERS   ||--o{ NOTIFICATIONS            : "receives (morph)"
+    USERS   ||--o{ ACTIVITY_LOGS            : "causes (morph)"
+    ROLES   ||--o{ MODEL_HAS_ROLES          : "assigned to"
+    ROLES   ||--o{ ROLE_HAS_PERMISSIONS     : grants
+    PERMISSIONS ||--o{ MODEL_HAS_PERMISSIONS : "assigned to"
+    PERMISSIONS ||--o{ ROLE_HAS_PERMISSIONS  : "granted via"
+    USERS   ||--o| PassWORD_RESET_TOKENS : "reset (super-admin only)"

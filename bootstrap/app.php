@@ -1,0 +1,175 @@
+<?php
+
+use App\Facades\ApiResponse;
+use App\Http\Middleware\HandleInertiaRequests;
+use Illuminate\Database\QueryException;
+use Illuminate\Foundation\Application;
+use Illuminate\Foundation\Configuration\Exceptions;
+use Illuminate\Foundation\Configuration\Middleware;
+use Illuminate\Http\Request;
+use Illuminate\Routing\Middleware\SubstituteBindings;
+use Illuminate\Support\Facades\Route;
+use Inertia\Inertia;
+use Spatie\Permission\Middleware\PermissionMiddleware;
+use Spatie\Permission\Middleware\RoleMiddleware;
+use Spatie\Permission\Middleware\RoleOrPermissionMiddleware;
+use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
+
+return Application::configure(basePath: dirname(__DIR__))
+    ->withRouting(
+        commands: __DIR__.'/../routes/console.php',
+        using: function (): void {
+            // The framework `health:` option is ignored once a custom `using`
+            // closure is provided, so register the probe explicitly.
+            Route::get('/up', fn () => response('OK'));
+
+            Route::middleware('api')
+                ->prefix('v1')
+                ->name('v1.')
+                ->group(base_path('routes/admin-v1.php'));
+
+            // The anonymous public API. Mounted on an explicit middleware
+            // array, not the `api` group: statefulApi() prepends session
+            // middleware to `api`, which would start a session and set a
+            // cookie on every anonymous GET — killing response caching for
+            // no benefit. Staying under the v1/ prefix keeps the JSON error
+            // rendering and the FK-violation handler below.
+            Route::middleware([
+                SubstituteBindings::class,
+                'throttle:public',
+            ])
+                ->prefix('v1/public')
+                ->name('v1.public.')
+                ->group(base_path('routes/public-v1.php'));
+
+            Route::middleware('web')
+                ->prefix('v1/student')
+                ->name('v1.student.')
+                ->group(base_path('routes/student-v1.php'));
+
+            Route::middleware('web')
+                ->prefix('v1/teacher')
+                ->name('v1.teacher.')
+                ->group(base_path('routes/teacher-v1.php'));
+
+            Route::middleware('web')
+                ->group(base_path('routes/web.php'));
+
+            // The staff side of the app: same `web` group as routes/web.php,
+            // mounted under /admin.
+            Route::middleware('web')
+                ->prefix('admin')
+                ->group(base_path('routes/web-admin.php'));
+        },
+    )
+    ->withMiddleware(function (Middleware $middleware): void {
+        // Containerized deploys sit behind a reverse proxy (Coolify/Traefik);
+        // trust it so Laravel honors X-Forwarded-* and generates https URLs.
+        $middleware->trustProxies(at: '*');
+
+        // Let same-domain browser requests to the versioned API authenticate
+        // with the existing session cookie instead of a token. Requests from
+        // other origins (the mobile app) are untouched and still use Bearer
+        // tokens. This only affects the `api` group — the `web`/Inertia stack
+        // below is unchanged. এর মানে auth:sanctum একই ডোমেইনের ব্রাউজার রিকোয়েস্টে session cookie দিয়েও পাস করবে, আর মোবাইল/এক্সটার্নাল ক্লায়েন্টে Bearer token দিয়ে। তাই একই middleware দুই ধরনের ক্লায়েন্ট সামলাচ্ছে — এটাই ডিজাইন, ভাঙার দরকার নেই।
+        $middleware->statefulApi();
+
+        // The locale cookie is a plain preference — leaving it unencrypted
+        // keeps it readable before the encrypter runs and in tests.
+        $middleware->encryptCookies(except: ['locale', 'llb_vid']);
+
+        // Spatie route middleware: `role:super-admin`, `permission:users.view`
+        $middleware->alias([
+            'role' => RoleMiddleware::class,
+            'permission' => PermissionMiddleware::class,
+            'role_or_permission' => RoleOrPermissionMiddleware::class,
+        ]);
+
+        // Run Inertia's middleware on every web request so each page
+        // can share data (like the logged-in user) with React.
+        $middleware->web(append: [
+            HandleInertiaRequests::class,
+        ]);
+
+        // Where to send guests hitting an `auth` route, and where to send
+        // already-authenticated users hitting a `guest` route.
+        $middleware->redirectGuestsTo(function (Request $request) {
+            if ($request->is('admin', 'admin/*')) {
+                return '/admin/login';
+            }
+
+            $locale = in_array($request->route()?->parameter('locale'), config('llb.locales'), true)
+                ? $request->route()->parameter('locale')
+                : config('llb.fallback_locale');
+
+            if ($request->is('*/teacher/*', '*/teacher')) {
+                return '/'.$locale.'/teacher/login?redirect='.urlencode('/'.$request->path());
+            }
+
+            return '/'.$locale.'/account/login?redirect='.urlencode('/'.$request->path());
+        });
+        $middleware->redirectUsersTo(function (Request $request) {
+            if ($request->is('admin', 'admin/*')) {
+                return '/admin/dashboard';
+            }
+
+            $locale = in_array($request->route()?->parameter('locale'), config('llb.locales'), true)
+                ? $request->route()->parameter('locale')
+                : config('llb.fallback_locale');
+
+            return '/'.$locale.'/exam-prep';
+        });
+    })
+    ->withExceptions(function (Exceptions $exceptions): void {
+        $exceptions->shouldRenderJsonWhen(
+            fn (Request $request) => $request->is('v1/*'),
+        );
+
+        $exceptions->render(function (NotFoundHttpException $e, Request $request) {
+            if ($request->is('v1/*')) {
+                return ApiResponse::respondNotFound('Record not found.');
+            }
+        });
+
+        // 23503 is the Postgres SQLSTATE; SQLite and MySQL raise 23000 with a
+        // foreign-key message, which is what the test suite exercises.
+        $exceptions->render(function (QueryException $e, Request $request) {
+            $isForeignKeyViolation = $e->getCode() === '23503'
+                || ($e->getCode() === '23000' && stripos($e->getMessage(), 'foreign key') !== false);
+
+            if ($isForeignKeyViolation && $request->is('v1/*')) {
+                return ApiResponse::respondError(
+                    'This record is linked to other data and cannot be modified or deleted.',
+                    409,
+                    $e
+                );
+            }
+        });
+
+        // Render friendly Inertia pages for missing routes (404) and pages
+        // the permission middleware refused (403). The staff side and the
+        // public site get different pages — a student hitting a dead link
+        // must not land on an admin-branded screen.
+        $exceptions->respond(function (Response $response, Throwable $e, Request $request) {
+            if ($request->is('v1/*')) {
+                return $response;
+            }
+
+            $area = $request->is('admin', 'admin/*') ? 'admin' : 'public';
+
+            $page = match ($response->getStatusCode()) {
+                404 => "{$area}/errors/not-found/page",
+                403 => "{$area}/errors/forbidden/page",
+                default => null,
+            };
+
+            if ($page === null) {
+                return $response;
+            }
+
+            return Inertia::render($page)
+                ->toResponse($request)
+                ->setStatusCode($response->getStatusCode());
+        });
+    })->create();
